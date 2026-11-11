@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { doc, setDoc, serverTimestamp } from 'firebase/firestore';
 import { Save, Settings as SettingsIcon } from 'lucide-react';
-import { db } from '../../firebase/config';
+import { saveProfile } from '../../api/attendflow';
 import { useAuth } from '../../context/AuthContext';
 import toast from 'react-hot-toast';
 
@@ -23,16 +22,10 @@ const Settings = () => {
     if (!user) return;
     setSaving(true);
     try {
-      await setDoc(
-        doc(db, 'users', user.uid),
-        {
-          email: user.email,
-          displayName: displayName.trim(),
-          totalExpectedStudents: Number(totalExpectedStudents) || 40,
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
+      await saveProfile({
+        displayName: displayName.trim(),
+        totalExpectedStudents: Number(totalExpectedStudents) || 40,
+      });
       await refreshProfile();
       toast.success('Settings saved!');
     } catch {

@@ -1,79 +1,100 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import {
-  onAuthStateChanged,
-  signInWithEmailAndPassword,
-  createUserWithEmailAndPassword,
-  signOut,
-  updateProfile,
-} from 'firebase/auth';
-import { doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore';
-import { auth, db } from '../firebase/config';
+import { api, refreshSession } from '../api/client';
+import { fetchProfile, saveProfile } from '../api/attendflow';
+import { startRealtime, stopRealtime } from '../api/realtime';
 
 const AuthContext = createContext();
 
 export const useAuth = () => useContext(AuthContext);
+
+// Accounts live in the platform's auth-service (the same accounts as the career website).
+const toUser = (account) => ({
+  uid: account.id,
+  email: account.email,
+  displayName: account.full_name,
+});
+
+const DEFAULT_PROFILE = { displayName: '', totalExpectedStudents: 40 };
 
 export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
   const [teacherProfile, setTeacherProfile] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  const fetchTeacherProfile = async (uid, email, displayName) => {
+  const loadProfile = async (account) => {
     try {
-      const ref = doc(db, 'users', uid);
-      const snap = await getDoc(ref);
-      if (snap.exists()) {
-        setTeacherProfile(snap.data());
-      } else {
-        const defaultProfile = {
-          email,
-          displayName: displayName || email?.split('@')[0] || 'Teacher',
-          totalExpectedStudents: 40,
-          updatedAt: serverTimestamp(),
-        };
-        await setDoc(ref, defaultProfile);
-        setTeacherProfile(defaultProfile);
-      }
+      const profile = await fetchProfile();
+      setTeacherProfile({ ...profile, displayName: profile.displayName || account.displayName });
     } catch (err) {
       console.error('Error loading teacher profile:', err);
+      setTeacherProfile({ ...DEFAULT_PROFILE, displayName: account.displayName });
     }
+  };
+
+  const signedIn = async (account) => {
+    const next = toUser(account);
+    setUser(next);
+    await loadProfile(next);
+    startRealtime();
+    return next;
   };
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-      setUser(currentUser);
-      if (currentUser) {
-        await fetchTeacherProfile(currentUser.uid, currentUser.email, currentUser.displayName);
-      } else {
+    const restore = async () => {
+      try {
+        let account;
+        try {
+          account = await api('/api/v1/auth/me');
+        } catch (err) {
+          if (err.status !== 401) throw err;
+          // The access token expired; the refresh cookie may still be valid.
+          account = (await refreshSession()).user;
+        }
+        await signedIn(account);
+      } catch {
+        setUser(null);
         setTeacherProfile(null);
+      } finally {
+        setLoading(false);
       }
-      setLoading(false);
-    });
-    return unsubscribe;
+    };
+    restore();
+    return () => stopRealtime();
   }, []);
 
-  const login = (email, password) => signInWithEmailAndPassword(auth, email, password);
-
-  const registerTeacher = async (name, email, password, totalExpectedStudents = 40) => {
-    const cred = await createUserWithEmailAndPassword(auth, email, password);
-    await updateProfile(cred.user, { displayName: name });
-    const profileData = {
-      email,
-      displayName: name,
-      totalExpectedStudents: Number(totalExpectedStudents) || 40,
-      updatedAt: serverTimestamp(),
-    };
-    await setDoc(doc(db, 'users', cred.user.uid), profileData);
-    setTeacherProfile(profileData);
-    return cred;
+  const login = async (email, password) => {
+    const session = await api('/api/v1/auth/login', { method: 'POST', body: { email, password } });
+    return signedIn(session.user);
   };
 
-  const logout = () => signOut(auth);
+  const registerTeacher = async (name, email, password, totalExpectedStudents = 40) => {
+    const session = await api('/api/v1/auth/register', {
+      method: 'POST',
+      body: { full_name: name, email, password, account_type: 'worker', accept_terms: true },
+    });
+    const next = toUser(session.user);
+    setUser(next);
+    try {
+      setTeacherProfile(await saveProfile({ displayName: name, totalExpectedStudents }));
+    } catch {
+      setTeacherProfile({ displayName: name, totalExpectedStudents: Number(totalExpectedStudents) || 40 });
+    }
+    startRealtime();
+    return next;
+  };
+
+  const logout = async () => {
+    stopRealtime();
+    try {
+      await api('/api/v1/auth/logout', { method: 'POST' });
+    } finally {
+      setUser(null);
+      setTeacherProfile(null);
+    }
+  };
 
   const refreshProfile = async () => {
-    if (user) {
-      await fetchTeacherProfile(user.uid, user.email, user.displayName);
-    }
+    if (user) await loadProfile(user);
   };
 
   return (

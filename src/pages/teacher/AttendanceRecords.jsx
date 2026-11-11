@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { collection, query, where, getDocs } from 'firebase/firestore';
 import { Search, FileSpreadsheet, Filter } from 'lucide-react';
-import { db } from '../../firebase/config';
+import { fetchAllAttendance, fetchSessions } from '../../api/attendflow';
 import { useAuth } from '../../context/AuthContext';
 import { formatDateOnly, formatDateTime } from '../../utils/dateUtils';
 import { exportAttendanceToExcel } from '../../utils/exportExcel';
@@ -23,16 +22,7 @@ const AttendanceRecords = () => {
       if (!user) return;
       setLoading(true);
       try {
-        const attQ = query(collection(db, 'attendance'), where('teacherId', '==', user.uid));
-        const sessQ = query(collection(db, 'sessions'), where('createdBy', '==', user.uid));
-
-        const [attSnap, sessSnap] = await Promise.all([getDocs(attQ), getDocs(sessQ)]);
-
-        const attList = attSnap.docs
-          .map((d) => ({ id: d.id, ...d.data() }))
-          .sort((a, b) => (b.submittedAt?.seconds || 0) - (a.submittedAt?.seconds || 0));
-
-        const sessList = sessSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        const [attList, sessList] = await Promise.all([fetchAllAttendance(), fetchSessions()]);
 
         setRecords(attList);
         setSessions(sessList);
@@ -63,7 +53,7 @@ const AttendanceRecords = () => {
 
   const handleExportFiltered = () => {
     try {
-      exportAttendanceToExcel(filteredRecords, 'Filtered_Attendance_Records');
+      exportAttendanceToExcel({ title: 'Filtered records', className: 'Selected classes' }, filteredRecords);
       toast.success('Exported filtered records to Excel!');
     } catch (err) {
       toast.error(err.message);

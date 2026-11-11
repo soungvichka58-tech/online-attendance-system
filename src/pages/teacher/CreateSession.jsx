@@ -1,8 +1,10 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { collection, addDoc, serverTimestamp, Timestamp } from 'firebase/firestore';
 import { CalendarPlus, Copy, CheckCircle2, ExternalLink, ArrowLeft } from 'lucide-react';
-import { db } from '../../firebase/config';
+import { saveSession } from '../../api/attendflow';
+import StudentListPicker from '../../components/StudentListPicker';
+import LocationRestriction from '../../components/LocationRestriction';
+import { emptyLocationSettings, buildSessionRestrictions } from '../../utils/sessionRestrictions';
 import { useAuth } from '../../context/AuthContext';
 import { toDateTimeLocalString } from '../../utils/dateUtils';
 import toast from 'react-hot-toast';
@@ -23,9 +25,14 @@ const CreateSession = () => {
   const [closesAt, setClosesAt] = useState(toDateTimeLocalString(oneHourLater));
   const [loading, setLoading] = useState(false);
   const [createdSessionId, setCreatedSessionId] = useState(null);
+  const [rosterList, setRosterList] = useState(null);
+  const [locationSettings, setLocationSettings] = useState(emptyLocationSettings);
+  const [importing, setImporting] = useState(false);
+  const [locating, setLocating] = useState(false);
 
   const handleCreate = async (e) => {
     e.preventDefault();
+    if (loading || importing || locating) return;
 
     const cleanTitle = title.trim();
     const cleanClass = className.trim();
@@ -40,29 +47,33 @@ const CreateSession = () => {
       toast.error('Please enter a valid class or group name.');
       return;
     }
-    if (closeDate <= openDate) {
+    if (!Number.isFinite(openDate.getTime()) || !Number.isFinite(closeDate.getTime()) || closeDate <= openDate) {
       toast.error('Closing time must be after the opening time.');
+      return;
+    }
+
+    try {
+      buildSessionRestrictions(rosterList, locationSettings);
+    } catch (err) {
+      toast.error(err.message);
       return;
     }
 
     setLoading(true);
     try {
-      const docRef = await addDoc(collection(db, 'sessions'), {
+      const docRef = await saveSession({ rosterList, locationSettings, sessionData: {
         title: cleanTitle,
         className: cleanClass,
         expectedStudents: Number(expectedStudents) || 40,
-        createdBy: user.uid,
-        createdAt: serverTimestamp(),
-        opensAt: Timestamp.fromDate(openDate),
-        closesAt: Timestamp.fromDate(closeDate),
-        status: 'active',
-      });
+        opensAt: openDate,
+        closesAt: closeDate,
+      } });
 
       setCreatedSessionId(docRef.id);
       toast.success('Attendance session created!');
     } catch (err) {
       console.error(err);
-      toast.error('Failed to create session. Check permissions.');
+      toast.error(err.message || 'Failed to create session.');
     } finally {
       setLoading(false);
     }
@@ -189,7 +200,8 @@ const CreateSession = () => {
                 min="1"
                 max="2000"
                 required
-                value={expectedStudents}
+                value={rosterList?.studentCount || expectedStudents}
+                readOnly={Boolean(rosterList)}
                 onChange={(e) => setExpectedStudents(e.target.value)}
                 className="w-full px-4 py-2.5 rounded-xl border border-slate-300 text-sm focus:ring-2 focus:ring-indigo-600 focus:border-indigo-600 outline-none"
               />
@@ -224,10 +236,13 @@ const CreateSession = () => {
             </div>
           </div>
 
+          <StudentListPicker teacherId={user?.uid} value={rosterList} onChange={setRosterList} onBusyChange={setImporting} disabled={loading} />
+          <LocationRestriction value={locationSettings} onChange={setLocationSettings} onBusyChange={setLocating} disabled={loading} />
+
           <div className="pt-2">
             <button
               type="submit"
-              disabled={loading}
+              disabled={loading || importing || locating}
               className="w-full py-3 px-4 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white font-semibold rounded-xl shadow-md shadow-indigo-200 transition"
             >
               {loading ? 'Generating Session Link...' : 'Create Session & Generate Link'}

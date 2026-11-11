@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { collection, query, where, getDocs } from 'firebase/firestore';
 import { FileSpreadsheet, Download } from 'lucide-react';
-import { db } from '../../firebase/config';
+import { fetchAllAttendance, fetchSessions } from '../../api/attendflow';
 import { useAuth } from '../../context/AuthContext';
 import { exportAttendanceToExcel } from '../../utils/exportExcel';
 import { formatDateTime } from '../../utils/dateUtils';
@@ -18,21 +17,9 @@ const ExportReports = () => {
       if (!user) return;
       setLoading(true);
       try {
-        const [sessSnap, attSnap] = await Promise.all([
-          getDocs(query(collection(db, 'sessions'), where('createdBy', '==', user.uid))),
-          getDocs(query(collection(db, 'attendance'), where('teacherId', '==', user.uid))),
-        ]);
-
-        setSessions(
-          sessSnap.docs
-            .map((d) => ({ id: d.id, ...d.data() }))
-            .sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0))
-        );
-        setAttendance(
-          attSnap.docs
-            .map((d) => ({ id: d.id, ...d.data() }))
-            .sort((a, b) => (b.submittedAt?.seconds || 0) - (a.submittedAt?.seconds || 0))
-        );
+        const [sessionList, attendanceList] = await Promise.all([fetchSessions(), fetchAllAttendance()]);
+        setSessions(sessionList);
+        setAttendance(attendanceList);
       } catch {
         toast.error('Failed to load export data.');
       } finally {
@@ -44,7 +31,7 @@ const ExportReports = () => {
 
   const exportAll = () => {
     try {
-      exportAttendanceToExcel(attendance, 'All_Attendance_Records');
+      exportAttendanceToExcel({ title: 'All sessions', className: 'All classes' }, attendance);
       toast.success('Complete attendance workbook downloaded!');
     } catch (err) {
       toast.error(err.message);
@@ -54,7 +41,7 @@ const ExportReports = () => {
   const exportSingleSession = (session) => {
     const sessionRecords = attendance.filter((a) => a.sessionId === session.id);
     try {
-      exportAttendanceToExcel(sessionRecords, `${session.title}_${session.className}`);
+      exportAttendanceToExcel(session, sessionRecords);
       toast.success(`Exported ${session.title}!`);
     } catch (err) {
       toast.error(err.message);

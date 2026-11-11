@@ -1,16 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
-  doc,
-  getDoc,
-  updateDoc,
-  collection,
-  query,
-  where,
-  getDocs,
-  Timestamp,
-} from 'firebase/firestore';
-import {
   ArrowLeft,
   Copy,
   FileSpreadsheet,
@@ -19,7 +9,20 @@ import {
   Unlock,
   ExternalLink,
 } from 'lucide-react';
-import { db } from '../../firebase/config';
+import {
+  fetchSession,
+  fetchSessionAttendance,
+  fetchStudentList,
+  saveSession,
+  setSessionStatus,
+  mapAttendance,
+} from '../../api/attendflow';
+import { ATTENDANCE_CREATED, onRealtime } from '../../api/realtime';
+import StudentListPicker from '../../components/StudentListPicker';
+import RosterComparison from '../../components/RosterComparison';
+import LocationRestriction from '../../components/LocationRestriction';
+import { compareRoster } from '../../utils/roster';
+import { emptyLocationSettings, locationSettingsFromSession, buildSessionRestrictions } from '../../utils/sessionRestrictions';
 import { useAuth } from '../../context/AuthContext';
 import {
   formatDateTime,
@@ -44,44 +47,53 @@ const SessionDetails = () => {
   const [opensAt, setOpensAt] = useState('');
   const [closesAt, setClosesAt] = useState('');
   const [saving, setSaving] = useState(false);
+  const [rosterList, setRosterList] = useState(null);
+  const [savedRosterList, setSavedRosterList] = useState(null);
+  const [rosterWarning, setRosterWarning] = useState('');
+  const [locationSettings, setLocationSettings] = useState(emptyLocationSettings);
+  const [importing, setImporting] = useState(false);
+  const [locating, setLocating] = useState(false);
+  const [loadError, setLoadError] = useState('');
 
   const fetchDetails = async () => {
     if (!user || !sessionId) return;
     setLoading(true);
+    setLoadError('');
     try {
-      const sessionRef = doc(db, 'sessions', sessionId);
-      const sessionSnap = await getDoc(sessionRef);
-
-      if (!sessionSnap.exists() || sessionSnap.data().createdBy !== user.uid) {
+      let data;
+      try {
+        data = await fetchSession(sessionId);
+      } catch (err) {
+        if (err.status !== 404) throw err;
         toast.error('Session not found or unauthorized.');
         navigate('/sessions');
         return;
       }
 
-      const data = { id: sessionSnap.id, ...sessionSnap.data() };
+      let roster = null;
+      setRosterWarning('');
+      if (data.requiresRoster && data.rosterListId) {
+        try {
+          roster = await fetchStudentList(data.rosterListId);
+        } catch (err) {
+          console.error(err);
+          setRosterWarning(`The saved list "${data.rosterListName || 'Student list'}" used by this session could not be loaded. It may have been deleted. Choose another list or none, then save.`);
+        }
+      }
+      setRosterList(roster);
+      setSavedRosterList(roster);
+      setLocationSettings(locationSettingsFromSession(data));
       setSession(data);
       setTitle(data.title || '');
       setClassName(data.className || '');
       setExpectedStudents(data.expectedStudents || 40);
-      if (data.opensAt?.toDate) {
-        setOpensAt(toDateTimeLocalString(data.opensAt.toDate()));
-      }
-      if (data.closesAt?.toDate) {
-        setClosesAt(toDateTimeLocalString(data.closesAt.toDate()));
-      }
+      if (data.opensAt) setOpensAt(toDateTimeLocalString(data.opensAt));
+      if (data.closesAt) setClosesAt(toDateTimeLocalString(data.closesAt));
 
-      const q = query(
-        collection(db, 'attendance'),
-        where('teacherId', '==', user.uid),
-        where('sessionId', '==', sessionId)
-      );
-      const attSnap = await getDocs(q);
-      const list = attSnap.docs
-        .map((d) => ({ id: d.id, ...d.data() }))
-        .sort((a, b) => (b.submittedAt?.seconds || 0) - (a.submittedAt?.seconds || 0));
-      setRecords(list);
+      setRecords(await fetchSessionAttendance(sessionId));
     } catch (err) {
       console.error(err);
+      setLoadError(err.message || 'Unable to load session settings.');
       toast.error('Error loading session details.');
     } finally {
       setLoading(false);
@@ -92,12 +104,27 @@ const SessionDetails = () => {
     fetchDetails();
   }, [sessionId, user]);
 
+  // Live check-ins, pushed through the platform's realtime connection.
+  useEffect(() => onRealtime(ATTENDANCE_CREATED, (data) => {
+    if (data.session_id !== sessionId) return;
+    const record = mapAttendance(data);
+    setRecords((prev) => (prev.some((r) => r.id === record.id) ? prev : [record, ...prev]));
+    toast.success(`${record.studentName} checked in`, { id: `checkin-${record.id}` });
+  }), [sessionId]);
+
   const handleSaveChanges = async (e) => {
     e.preventDefault();
+    if (saving || importing || locating || loadError) return;
     const openDate = new Date(opensAt);
     const closeDate = new Date(closesAt);
-    if (closeDate <= openDate) {
+    if (!Number.isFinite(openDate.getTime()) || !Number.isFinite(closeDate.getTime()) || closeDate <= openDate) {
       toast.error('Closing time must be after opening time.');
+      return;
+    }
+    try {
+      buildSessionRestrictions(rosterList, locationSettings);
+    } catch (err) {
+      toast.error(err.message);
       return;
     }
 
@@ -107,14 +134,16 @@ const SessionDetails = () => {
         title: title.trim(),
         className: className.trim(),
         expectedStudents: Number(expectedStudents) || 40,
-        opensAt: Timestamp.fromDate(openDate),
-        closesAt: Timestamp.fromDate(closeDate),
+        opensAt: openDate,
+        closesAt: closeDate,
       };
-      await updateDoc(doc(db, 'sessions', sessionId), updates);
-      setSession((prev) => ({ ...prev, ...updates }));
+      const saved = await saveSession({ sessionId, sessionData: updates, rosterList, locationSettings });
+      setSession((prev) => ({ ...prev, ...saved }));
+      setSavedRosterList(rosterList);
+      setRosterWarning('');
       toast.success('Session updated successfully!');
-    } catch {
-      toast.error('Failed to update session.');
+    } catch (err) {
+      toast.error(err.message || 'Failed to update session.');
     } finally {
       setSaving(false);
     }
@@ -124,8 +153,8 @@ const SessionDetails = () => {
     if (!session) return;
     const nextStatus = session.status === 'closed' ? 'active' : 'closed';
     try {
-      await updateDoc(doc(db, 'sessions', sessionId), { status: nextStatus });
-      setSession((prev) => ({ ...prev, status: nextStatus }));
+      const saved = await setSessionStatus(sessionId, nextStatus);
+      setSession((prev) => ({ ...prev, ...saved }));
       toast.success(nextStatus === 'closed' ? 'Session closed.' : 'Session re-opened.');
     } catch {
       toast.error('Failed to change status.');
@@ -134,7 +163,7 @@ const SessionDetails = () => {
 
   const handleExport = () => {
     try {
-      exportAttendanceToExcel(records, `${session?.title}_${session?.className}`);
+      exportAttendanceToExcel(session, records);
       toast.success('Excel report downloaded!');
     } catch (err) {
       toast.error(err.message);
@@ -152,6 +181,11 @@ const SessionDetails = () => {
   }
 
   const computedStatus = getSessionComputedStatus(session);
+  const savedPresentCount = savedRosterList
+    ? compareRoster(savedRosterList.students, records).filter((row) => row.attendance).length
+    : records.length;
+
+  if (loadError) return <div role="alert" className="rounded-2xl border border-rose-200 bg-rose-50 p-6 space-y-3"><p className="text-sm text-rose-700">{loadError}</p><button onClick={fetchDetails} className="text-sm font-semibold text-indigo-600">Retry loading session</button></div>;
 
   return (
     <div className="space-y-6">
@@ -274,7 +308,8 @@ const SessionDetails = () => {
                 type="number"
                 min="1"
                 required
-                value={expectedStudents}
+                value={rosterList?.studentCount || expectedStudents}
+                readOnly={Boolean(rosterList)}
                 onChange={(e) => setExpectedStudents(e.target.value)}
                 className="w-full px-3.5 py-2 rounded-xl border border-slate-300 text-sm"
               />
@@ -303,9 +338,13 @@ const SessionDetails = () => {
                 className="w-full px-3.5 py-2 rounded-xl border border-slate-300 text-sm"
               />
             </div>
+            {rosterWarning && <p role="alert" className="rounded-xl bg-amber-50 p-3 text-xs text-amber-800">{rosterWarning}</p>}
+            <StudentListPicker teacherId={user?.uid} value={rosterList} onChange={setRosterList} onBusyChange={setImporting} disabled={saving} />
+            <LocationRestriction value={locationSettings} onChange={setLocationSettings} onBusyChange={setLocating} disabled={saving} />
+            <p className="text-xs text-slate-500">Save Changes to apply the student list and location settings. Existing attendance is kept when you switch lists.</p>
             <button
               type="submit"
-              disabled={saving}
+              disabled={saving || importing || locating}
               className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold rounded-xl flex items-center justify-center gap-2 transition"
             >
               <Save className="w-4 h-4" />
@@ -318,10 +357,10 @@ const SessionDetails = () => {
           <div className="p-5 border-b border-slate-100 flex items-center justify-between">
             <div>
               <h2 className="font-bold text-slate-900">
-                Submitted Attendance ({records.length} / {expectedStudents})
+                Submitted Attendance ({records.length} / {session.expectedStudents})
               </h2>
               <p className="text-xs text-slate-500">
-                Absent: {Math.max(0, expectedStudents - records.length)} students
+                Absent: {Math.max(0, session.expectedStudents - savedPresentCount)} students
               </p>
             </div>
             <button
@@ -345,6 +384,7 @@ const SessionDetails = () => {
                     <th className="py-3 px-4">Student ID</th>
                     <th className="py-3 px-4">Full Name</th>
                     <th className="py-3 px-4">Submitted At</th>
+                    <th className="py-3 px-4">Location at check-in</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-sm">
@@ -358,6 +398,7 @@ const SessionDetails = () => {
                       <td className="py-3 px-4 text-slate-500">
                         {formatDateTime(r.submittedAt)}
                       </td>
+                      <td className="py-3 px-4 text-xs text-slate-500">{Number.isFinite(r.distanceMeters) ? `${Math.ceil(r.distanceMeters)} m away · ±${Math.ceil(r.locationAccuracy)} m accuracy` : 'Not requested'}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -366,6 +407,7 @@ const SessionDetails = () => {
           )}
         </div>
       </div>
+      {savedRosterList && <RosterComparison students={savedRosterList.students} records={records} />}
     </div>
   );
 };
