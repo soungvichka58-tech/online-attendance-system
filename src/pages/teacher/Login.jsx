@@ -13,6 +13,7 @@ const Login = () => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [expectedStudents, setExpectedStudents] = useState(40);
+  const [acceptTerms, setAcceptTerms] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   if (user) {
@@ -34,6 +35,16 @@ const Login = () => {
           setSubmitting(false);
           return;
         }
+        if (password.length < 8) {
+          toast.error('Password must be at least 8 characters.');
+          setSubmitting(false);
+          return;
+        }
+        if (!acceptTerms) {
+          toast.error('Please accept the terms of use and privacy policy.');
+          setSubmitting(false);
+          return;
+        }
         await registerTeacher(name.trim(), email.trim(), password, Number(expectedStudents) || 40);
         toast.success('Teacher account created! Welcome.');
       } else {
@@ -43,12 +54,14 @@ const Login = () => {
       navigate('/dashboard');
     } catch (err) {
       const code = err.code || '';
-      if (code === 'auth/invalid-credential' || code === 'auth/wrong-password') {
+      if (code === 'invalid_credentials') {
         toast.error('Invalid email or password.');
-      } else if (code === 'auth/email-already-in-use') {
+      } else if (code === 'email_taken') {
         toast.error('This email is already registered. Please sign in.');
-      } else if (code === 'auth/weak-password') {
-        toast.error('Password should be at least 6 characters.');
+      } else if (code === 'account_suspended') {
+        toast.error('This account is suspended.');
+      } else if (code === 'rate_limited') {
+        toast.error('Too many attempts. Please wait a few minutes and try again.');
       } else {
         toast.error(err.message || 'Authentication failed.');
       }
@@ -153,6 +166,24 @@ const Login = () => {
                 />
               </div>
             </div>
+
+            {isRegistering && (
+              <label className="flex items-start gap-2 text-xs text-slate-600">
+                <input
+                  type="checkbox"
+                  checked={acceptTerms}
+                  onChange={(e) => setAcceptTerms(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <span>
+                  I accept the{' '}
+                  <a href="https://career.xmus.me/en/terms" target="_blank" rel="noreferrer" className="font-semibold text-indigo-600">terms of use</a>{' '}
+                  and{' '}
+                  <a href="https://career.xmus.me/en/privacy" target="_blank" rel="noreferrer" className="font-semibold text-indigo-600">privacy policy</a>.
+                  Your account also works on the career website.
+                </span>
+              </label>
+            )}
 
             <button
               type="submit"

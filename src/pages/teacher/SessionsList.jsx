@@ -1,15 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
-  collection,
-  query,
-  where,
-  getDocs,
-  doc,
-  updateDoc,
-  deleteDoc,
-} from 'firebase/firestore';
-import {
   PlusCircle,
   Copy,
   Eye,
@@ -18,7 +9,7 @@ import {
   Trash2,
   Search,
 } from 'lucide-react';
-import { db } from '../../firebase/config';
+import { deleteSession, fetchSessions, setSessionStatus } from '../../api/attendflow';
 import { useAuth } from '../../context/AuthContext';
 import { formatDateTime, getSessionComputedStatus } from '../../utils/dateUtils';
 import toast from 'react-hot-toast';
@@ -29,16 +20,11 @@ const SessionsList = () => {
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
 
-  const fetchSessions = async () => {
+  const loadSessions = async () => {
     if (!user) return;
     setLoading(true);
     try {
-      const q = query(collection(db, 'sessions'), where('createdBy', '==', user.uid));
-      const snap = await getDocs(q);
-      const list = snap.docs
-        .map((d) => ({ id: d.id, ...d.data() }))
-        .sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
-      setSessions(list);
+      setSessions(await fetchSessions());
     } catch (err) {
       console.error(err);
       toast.error('Failed to load sessions');
@@ -48,16 +34,14 @@ const SessionsList = () => {
   };
 
   useEffect(() => {
-    fetchSessions();
+    loadSessions();
   }, [user]);
 
   const toggleStatus = async (session) => {
     const newStatus = session.status === 'closed' ? 'active' : 'closed';
     try {
-      await updateDoc(doc(db, 'sessions', session.id), { status: newStatus });
-      setSessions((prev) =>
-        prev.map((s) => (s.id === session.id ? { ...s, status: newStatus } : s))
-      );
+      const saved = await setSessionStatus(session.id, newStatus);
+      setSessions((prev) => prev.map((s) => (s.id === session.id ? saved : s)));
       toast.success(
         newStatus === 'closed' ? 'Session closed manually.' : 'Session re-opened.'
       );
@@ -67,9 +51,9 @@ const SessionsList = () => {
   };
 
   const handleDelete = async (sessionId) => {
-    if (!window.confirm('Delete this session permanently?')) return;
+    if (!window.confirm('Delete this session and its attendance records permanently?')) return;
     try {
-      await deleteDoc(doc(db, 'sessions', sessionId));
+      await deleteSession(sessionId);
       setSessions((prev) => prev.filter((s) => s.id !== sessionId));
       toast.success('Session deleted.');
     } catch {

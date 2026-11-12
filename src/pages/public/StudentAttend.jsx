@@ -1,6 +1,5 @@
 import React, { useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore';
 import {
   GraduationCap,
   CheckCircle2,
@@ -8,9 +7,15 @@ import {
   Clock,
   Send,
   ShieldCheck,
+  MapPin,
+  UserCheck,
+  UserX,
 } from 'lucide-react';
-import { db } from '../../firebase/config';
 import { formatDateTime, getSessionComputedStatus } from '../../utils/dateUtils';
+import { normalizeStudentId, isValidStudentId } from '../../utils/roster';
+import { getCurrentPosition, checkStudentLocation } from '../../utils/location';
+import { locationSettingsFromSession } from '../../utils/sessionRestrictions';
+import { checkIn, fetchPublicSession, lookupStudent } from '../../api/attendflow';
 
 const StudentAttend = () => {
   const { sessionId } = useParams();
@@ -24,21 +29,49 @@ const StudentAttend = () => {
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState('');
   const [submittedSuccess, setSubmittedSuccess] = useState(false);
+  const [submissionStage, setSubmissionStage] = useState('');
+  const [locationResult, setLocationResult] = useState(null);
+  const [submittedName, setSubmittedName] = useState('');
+  // Result of looking up the typed ID in the session's class list.
+  const [lookup, setLookup] = useState({ status: 'idle', studentId: '', student: null });
+
+  const usesClassList = Boolean(session?.requiresRoster);
+  const normalizedInputId = normalizeStudentId(studentId);
+
+  useEffect(() => {
+    if (!usesClassList) return undefined;
+    if (!isValidStudentId(normalizedInputId)) {
+      setLookup({ status: 'idle', studentId: '', student: null });
+      return undefined;
+    }
+    let cancelled = false;
+    setLookup({ status: 'checking', studentId: normalizedInputId, student: null });
+    const timer = setTimeout(async () => {
+      try {
+        const student = await lookupStudent(sessionId, normalizedInputId);
+        if (!cancelled) setLookup({ status: student ? 'found' : 'notfound', studentId: normalizedInputId, student });
+      } catch (err) {
+        console.error(err);
+        if (!cancelled) setLookup({ status: 'error', studentId: normalizedInputId, student: null });
+      }
+    }, 400);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [usesClassList, sessionId, normalizedInputId]);
+
+  const confirmedStudent = lookup.status === 'found' && lookup.studentId === normalizedInputId ? lookup.student : null;
 
   useEffect(() => {
     const fetchSession = async () => {
       setLoading(true);
       setNetworkError('');
       try {
-        const ref = doc(db, 'sessions', sessionId);
-        const snap = await getDoc(ref);
-        if (!snap.exists()) {
-          setSession(null);
-        } else {
-          setSession({ id: snap.id, ...snap.data() });
-        }
+        setSession(await fetchPublicSession(sessionId));
       } catch (err) {
         console.error(err);
+        if (err.status === 404) {
+          setSession(null);
+          return;
+        }
         setNetworkError(
           'Unable to connect to the attendance server. Please check your internet connection and try again.'
         );
@@ -56,14 +89,23 @@ const StudentAttend = () => {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (submitting) return;
     setFormError('');
+    setLocationResult(null);
 
-    const cleanId = studentId.trim().toUpperCase();
-    const normalizedId = cleanId.replace(/[^A-Z0-9_-]/g, '');
-    const cleanName = studentName.trim().replace(/\s+/g, ' ');
+    const cleanId = normalizeStudentId(studentId);
+    const normalizedId = cleanId;
+    // With a class list, the saved name is used so records match the teacher's list.
+    const cleanName = usesClassList
+      ? confirmedStudent?.studentName ?? ''
+      : studentName.trim().replace(/\s+/g, ' ');
 
-    if (normalizedId.length < 2 || normalizedId.length > 30) {
-      setFormError('Please enter a valid Student ID (2–30 alphanumeric characters).');
+    if (!isValidStudentId(normalizedId)) {
+      setFormError('Student ID must contain 2–30 letters, numbers, underscores, or hyphens.');
+      return;
+    }
+    if (usesClassList && !confirmedStudent) {
+      setFormError(`Student ID "${normalizedId}" was not found in the class list. Check your ID and try again.`);
       return;
     }
     if (cleanName.length < 2 || cleanName.length > 100) {
@@ -79,50 +121,33 @@ const StudentAttend = () => {
 
     setSubmitting(true);
     try {
-      const attendanceDocId = `${session.id}_${normalizedId}`;
-      const attendanceRef = doc(db, 'attendance', attendanceDocId);
-
-      await setDoc(attendanceRef, {
-        studentId: cleanId,
-        studentIdNormalized: normalizedId,
-        studentName: cleanName,
-        sessionId: session.id,
-        sessionTitle: session.title,
-        className: session.className,
-        teacherId: session.createdBy,
-        submittedAt: serverTimestamp(),
-      });
-
+      let location;
+      if (session.requiresLocation) {
+        setSubmissionStage('Checking your location…');
+        // Checked here for a quick, friendly message; the server checks the distance again.
+        const result = checkStudentLocation(await getCurrentPosition(), locationSettingsFromSession(session));
+        setLocationResult(result);
+        location = { latitude: result.latitude, longitude: result.longitude, accuracy: result.accuracy };
+      }
+      setSubmissionStage('Recording attendance…');
+      const record = await checkIn(sessionId, { studentId: normalizedId, studentName: cleanName, location });
+      setSubmittedName(record.studentName);
       setSubmittedSuccess(true);
     } catch (err) {
       console.error('Submission error:', err);
-      if (err.code === 'permission-denied') {
+      if (err.code === 'session_closed' || err.code === 'session_not_open' || err.code === 'not_found') {
+        // Show the closed/not-open page with the latest session state.
         try {
-          const latestSnap = await getDoc(doc(db, 'sessions', session.id));
-          const latestSession = latestSnap.exists()
-            ? { id: latestSnap.id, ...latestSnap.data() }
-            : null;
-          setSession(latestSession);
-
-          if (!latestSession || getSessionComputedStatus(latestSession) !== 'open') {
-            setFormError('Attendance session is closed or has expired.');
-          } else {
-            setFormError(
-              `Student ID "${cleanId}" has already submitted attendance for this session.`
-            );
-          }
+          setSession(await fetchPublicSession(sessionId));
         } catch {
-          setFormError(
-            `Duplicate submission detected for Student ID "${cleanId}" or session is closed.`
-          );
+          setSession(null);
         }
-      } else {
-        setFormError(
-          'Network error occurred while submitting. Please check your connection and try again.'
-        );
       }
+      // Server messages explain the problem (already checked in, not on the list, too far…).
+      setFormError(err.message || 'Unable to submit attendance. Check your connection and try again.');
     } finally {
       setSubmitting(false);
+      setSubmissionStage('');
     }
   };
 
@@ -214,7 +239,7 @@ const StudentAttend = () => {
             </div>
             <div className="flex justify-between">
               <span className="text-slate-500">Name:</span>
-              <span className="font-semibold text-slate-900">{studentName.trim()}</span>
+              <span className="font-semibold text-slate-900">{submittedName}</span>
             </div>
             <div className="flex justify-between">
               <span className="text-slate-500">Class / Group:</span>
@@ -249,11 +274,18 @@ const StudentAttend = () => {
 
         <form onSubmit={handleSubmit} className="p-6 sm:p-8 space-y-5">
           {formError && (
-            <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-medium flex items-start gap-2.5">
+            <div role="alert" className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-medium flex items-start gap-2.5">
               <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
               <span>{formError}</span>
             </div>
           )}
+
+          {usesClassList && <p className="rounded-xl bg-indigo-50 p-3 text-xs text-indigo-700">Enter your student ID. Your name from the class list will appear so you can confirm it is you. Letter case does not matter.</p>}
+          {session.requiresLocation && <div className="rounded-xl border border-indigo-100 bg-indigo-50 p-3 space-y-2 text-xs text-indigo-800">
+            <p className="flex items-center gap-1.5 font-semibold"><MapPin className="w-4 h-4" />Location required: within {session.radiusMeters} m of the classroom</p>
+            <p>When you submit, allow precise location access. Your location and its accuracy are saved with your attendance and visible to your teacher.</p>
+            {locationResult && <p role="status">Reported location: {Math.ceil(locationResult.distanceMeters)} m away, ±{Math.ceil(locationResult.accuracy)} m accuracy.</p>}
+          </div>}
 
           <div>
             <label className="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-1.5">
@@ -275,33 +307,54 @@ const StudentAttend = () => {
               type="text"
               required
               value={studentId}
+              disabled={submitting}
               onChange={(e) => setStudentId(e.target.value)}
               placeholder="e.g., ST2026001"
               className="w-full px-4 py-3 rounded-xl border border-slate-300 text-sm font-mono uppercase focus:ring-2 focus:ring-indigo-600 focus:border-indigo-600 outline-none"
             />
           </div>
 
-          <div>
-            <label className="block text-xs font-semibold uppercase tracking-wider text-slate-700 mb-1.5">
-              Full Name <span className="text-rose-500">*</span>
-            </label>
-            <input
-              type="text"
-              required
-              value={studentName}
-              onChange={(e) => setStudentName(e.target.value)}
-              placeholder="Enter your full name"
-              className="w-full px-4 py-3 rounded-xl border border-slate-300 text-sm focus:ring-2 focus:ring-indigo-600 focus:border-indigo-600 outline-none"
-            />
-          </div>
+          {usesClassList ? (
+            <div aria-live="polite">
+              {lookup.status === 'checking' && <p className="text-xs text-slate-500">Checking the class list…</p>}
+              {confirmedStudent && (
+                <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 space-y-1">
+                  <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-emerald-700"><UserCheck className="w-4 h-4" />Is this you?</p>
+                  <p className="text-base font-bold text-slate-900">{confirmedStudent.studentName}</p>
+                  {confirmedStudent.nameKh && <p className="text-sm text-slate-800">{confirmedStudent.nameKh}</p>}
+                  <p className="text-xs text-slate-600">ID {confirmedStudent.studentId}{confirmedStudent.group ? ` · Group ${confirmedStudent.group}` : ''}</p>
+                  <p className="text-xs text-slate-500">If this is not you, correct your student ID.</p>
+                </div>
+              )}
+              {lookup.status === 'notfound' && lookup.studentId === normalizedInputId && (
+                <p role="alert" className="flex items-start gap-1.5 rounded-xl bg-rose-50 p-3 text-xs font-medium text-rose-700"><UserX className="w-4 h-4 shrink-0" />ID {lookup.studentId} is not in the class list for {session.className}. Check your ID.</p>
+              )}
+              {lookup.status === 'error' && <p role="alert" className="rounded-xl bg-amber-50 p-3 text-xs text-amber-800">Unable to check the class list. Check your connection and retype your ID.</p>}
+            </div>
+          ) : (
+            <div>
+              <label className="block text-xs font-semibold uppercase tracking-wider text-slate-700 mb-1.5">
+                Full Name <span className="text-rose-500">*</span>
+              </label>
+              <input
+                type="text"
+                required
+                value={studentName}
+                disabled={submitting}
+                onChange={(e) => setStudentName(e.target.value)}
+                placeholder="Enter your full name"
+                className="w-full px-4 py-3 rounded-xl border border-slate-300 text-sm focus:ring-2 focus:ring-indigo-600 focus:border-indigo-600 outline-none"
+              />
+            </div>
+          )}
 
           <button
             type="submit"
-            disabled={submitting}
+            disabled={submitting || (usesClassList && !confirmedStudent)}
             className="w-full py-3.5 px-4 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white font-semibold rounded-xl shadow-md shadow-indigo-200 flex items-center justify-center gap-2 transition"
           >
             <Send className="w-4 h-4" />
-            <span>{submitting ? 'Recording Attendance...' : 'Submit Attendance'}</span>
+            <span role="status">{submitting ? submissionStage : session.requiresLocation ? 'Check Location & Submit' : confirmedStudent ? 'Yes, Submit My Attendance' : 'Submit Attendance'}</span>
           </button>
 
           <div className="flex items-center justify-center gap-1.5 text-xs text-slate-400 pt-1">

@@ -1,12 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
-  collection,
-  query,
-  where,
-  getDocs,
-} from 'firebase/firestore';
-import {
   CalendarClock,
   Users,
   UserCheck,
@@ -16,11 +10,13 @@ import {
   Clock,
   Copy,
 } from 'lucide-react';
-import { db } from '../../firebase/config';
 import { useAuth } from '../../context/AuthContext';
 import StatCard from '../../components/StatCard';
 import { formatDateTime, getSessionComputedStatus } from '../../utils/dateUtils';
 import toast from 'react-hot-toast';
+import { compareRoster } from '../../utils/roster';
+import { fetchAllAttendance, fetchSessions, fetchStudentList, mapAttendance } from '../../api/attendflow';
+import { ATTENDANCE_CREATED, onRealtime } from '../../api/realtime';
 
 const Dashboard = () => {
   const { user, teacherProfile } = useAuth();
@@ -28,33 +24,19 @@ const Dashboard = () => {
   const [attendance, setAttendance] = useState([]);
   const [loading, setLoading] = useState(true);
   const [selectedSessionId, setSelectedSessionId] = useState('latest');
+  const [selectedRoster, setSelectedRoster] = useState(null);
+  const [rosterError, setRosterError] = useState(false);
 
   useEffect(() => {
     const fetchDashboardData = async () => {
       if (!user) return;
       setLoading(true);
       try {
-        const sessionsQ = query(
-          collection(db, 'sessions'),
-          where('createdBy', '==', user.uid)
-        );
-        const attendanceQ = query(
-          collection(db, 'attendance'),
-          where('teacherId', '==', user.uid)
-        );
-
-        const [sessionsSnap, attendanceSnap] = await Promise.all([
-          getDocs(sessionsQ),
-          getDocs(attendanceQ),
+        // Both arrive newest first.
+        const [sessionsList, attendanceList] = await Promise.all([
+          fetchSessions(),
+          fetchAllAttendance(),
         ]);
-
-        const sessionsList = sessionsSnap.docs
-          .map((d) => ({ id: d.id, ...d.data() }))
-          .sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
-
-        const attendanceList = attendanceSnap.docs
-          .map((d) => ({ id: d.id, ...d.data() }))
-          .sort((a, b) => (b.submittedAt?.seconds || 0) - (a.submittedAt?.seconds || 0));
 
         setSessions(sessionsList);
         setAttendance(attendanceList);
@@ -69,19 +51,38 @@ const Dashboard = () => {
     fetchDashboardData();
   }, [user]);
 
+  // Live check-ins for any of this teacher's sessions.
+  useEffect(() => onRealtime(ATTENDANCE_CREATED, (data) => {
+    const record = mapAttendance(data);
+    setAttendance((prev) => (prev.some((r) => r.id === record.id) ? prev : [record, ...prev]));
+  }), []);
+
   const activeSession =
     selectedSessionId === 'latest'
       ? sessions[0]
       : sessions.find((s) => s.id === selectedSessionId) || sessions[0];
+
+  useEffect(() => {
+    let cancelled = false;
+    setSelectedRoster(null);
+    setRosterError(false);
+    if (!activeSession?.requiresRoster) return;
+    fetchStudentList(activeSession.rosterListId).then((list) => {
+      if (!cancelled) setSelectedRoster({ sessionId: activeSession.id, students: list.students });
+    }).catch(() => { if (!cancelled) setRosterError(true); });
+    return () => { cancelled = true; };
+  }, [activeSession?.id, activeSession?.requiresRoster, activeSession?.rosterListId]);
 
   const expectedRoster =
     Number(activeSession?.expectedStudents) ||
     Number(teacherProfile?.totalExpectedStudents) ||
     40;
 
-  const presentInSelectedSession = activeSession
-    ? attendance.filter((a) => a.sessionId === activeSession.id).length
-    : 0;
+  const selectedRecords = attendance.filter((record) => record.sessionId === activeSession?.id);
+  const rosterReady = !activeSession?.requiresRoster || selectedRoster?.sessionId === activeSession?.id;
+  const presentInSelectedSession = activeSession?.requiresRoster
+    ? compareRoster(rosterReady ? selectedRoster.students : [], selectedRecords).filter((row) => row.attendance).length
+    : selectedRecords.length;
 
   const absentInSelectedSession = Math.max(0, expectedRoster - presentInSelectedSession);
 
@@ -154,9 +155,9 @@ const Dashboard = () => {
         />
         <StatCard
           title="Present Students"
-          value={presentInSelectedSession}
+          value={rosterReady ? presentInSelectedSession : '—'}
           subtitle={
-            activeSession
+            !rosterReady ? (rosterError ? 'Unable to load student list' : 'Loading student list…') : activeSession
               ? `${Math.round((presentInSelectedSession / expectedRoster) * 100 || 0)}% attendance rate`
               : 'No active session'
           }
@@ -165,7 +166,7 @@ const Dashboard = () => {
         />
         <StatCard
           title="Absent Students"
-          value={absentInSelectedSession}
+          value={rosterReady ? absentInSelectedSession : '—'}
           subtitle={activeSession ? `From ${activeSession.title}` : 'No active session'}
           icon={UserX}
           color="rose"

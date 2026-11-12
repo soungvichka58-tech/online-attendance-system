@@ -8,10 +8,10 @@ export const exportAttendanceToExcel = (sessionData, attendanceRecords) => {
     ["ATTENDANCE REPORT"],
     ["Session Title:", sessionData?.title || "N/A"],
     ["Class / Group:", sessionData?.className || "N/A"],
-    ["Date & Time:", new Date(sessionData?.createdAt?.toDate?.() || Date.now()).toLocaleString()],
+    ["Date & Time:", new Date(sessionData?.createdAt || Date.now()).toLocaleString()],
     ["Total Present:", records.length],
     [], // Empty row separator
-    ["No.", "Student ID", "Full Name", "Check-In Time", "Status"]
+    ["No.", "Student ID", "Full Name", "Session", "Check-In Time", "Status"]
   ];
 
   records.forEach((record, index) => {
@@ -19,7 +19,8 @@ export const exportAttendanceToExcel = (sessionData, attendanceRecords) => {
       index + 1,
       record.studentId || "N/A",
       record.studentName || "N/A",
-      new Date(record.submittedAt?.toDate?.() || Date.now()).toLocaleTimeString(),
+      record.sessionTitle || sessionData?.title || "N/A",
+      record.submittedAt ? new Date(record.submittedAt).toLocaleString() : "N/A",
       "Present"
     ]);
   });
@@ -30,7 +31,8 @@ export const exportAttendanceToExcel = (sessionData, attendanceRecords) => {
     { wch: 6 },
     { wch: 18 },
     { wch: 25 },
-    { wch: 18 },
+    { wch: 28 },
+    { wch: 22 },
     { wch: 12 }
   ];
 
